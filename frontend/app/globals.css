@@ -1,0 +1,359 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 25% 6%;
+    --foreground: 210 40% 98%;
+    --card: 222 24% 9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 24% 9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 156 100% 36%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 18% 14%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 222 18% 14%;
+    --muted-foreground: 215 16% 65%;
+    --accent: 222 18% 16%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 100% 67%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 18% 18%;
+    --input: 222 18% 18%;
+    --ring: 156 100% 36%;
+    --radius: 0.6rem;
+    --chart-1: 156 100% 36%;
+    --chart-2: 0 100% 67%;
+    --chart-3: 200 90% 50%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 280 65% 60%;
+    --sidebar-background: 220 25% 5%;
+    --sidebar-foreground: 210 40% 90%;
+    --sidebar-primary: 156 100% 36%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 222 18% 14%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 222 18% 18%;
+    --sidebar-ring: 156 100% 36%;
+  }
+}
+
+html, body {
+  background: #0c1015;
+  color-scheme: dark;
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; font-family: 'Inter', -apple-system, system-ui, sans-serif; }
+}
+
+.qx-bg-grid {
+  background-image:
+    linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.glow-green { box-shadow: 0 0 0 1px rgba(0,185,122,.4), 0 8px 30px rgba(0,185,122,.25); }
+.glow-red   { box-shadow: 0 0 0 1px rgba(255,85,85,.4), 0 8px 30px rgba(255,85,85,.25); }
+
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #2a3140; border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .55; }
+}
+.pulse-soft { animation: pulse-soft 1.6s ease-in-out infinite; }
+
+/* Slow gradient shimmer for hero/banner */
+@keyframes gradient-x {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.animate-gradient-x { background-size: 200% 200%; animation: gradient-x 6s ease infinite; }
+
+/* Glow pulse for action buttons */
+@keyframes glow-pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0,185,122,0.55), 0 6px 18px rgba(0,185,122,0.30); }
+  50%      { box-shadow: 0 0 0 6px rgba(0,185,122,0.05), 0 12px 28px rgba(0,185,122,0.45); }
+}
+@keyframes glow-pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,85,85,0.55), 0 6px 18px rgba(255,85,85,0.30); }
+  50%      { box-shadow: 0 0 0 6px rgba(255,85,85,0.05), 0 12px 28px rgba(255,85,85,0.45); }
+}
+.glow-pulse-green { animation: glow-pulse-green 2.4s ease-in-out infinite; }
+.glow-pulse-red   { animation: glow-pulse-red 2.4s ease-in-out infinite; }
+
+/* Subtle scale-in for hover cards */
+@keyframes float-y {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-2px); }
+}
+.float-y { animation: float-y 3s ease-in-out infinite; }
+
+/* Logo letter rainbow shift */
+@keyframes hue-shift {
+  from { filter: hue-rotate(0deg); }
+  to   { filter: hue-rotate(360deg); }
+}
+.hue-shift { animation: hue-shift 18s linear infinite; }
+
+/* Confetti-like sparkle */
+@keyframes sparkle {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+.sparkle { animation: sparkle 1.8s ease-in-out infinite; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   NEOTRADE public-website styles (verbatim from original NeoTrade index.css)
+   These classes are scoped to the public marketing pages (landing, auth,
+   legal) and do NOT affect the NEXTTRADE dashboard/admin/trade pages.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --app-bg: #080816;
+  --panel-bg: #0F0F1F;
+  --elevated-bg: #17172B;
+  --neo-brand: #8B5CF6;
+  --neo-brand-hover: #A78BFA;
+  --neo-brand-pink: #EC4899;
+  --neo-brand-cyan: #22D3EE;
+  --neo-buy: #00BFA5;
+  --neo-sell: #E53935;
+}
+
+@layer components {
+  /* Glass Panels */
+  .glass-panel {
+    @apply bg-panel/80 backdrop-blur-xl border border-white/10;
+  }
+  .glass-panel-hover {
+    @apply glass-panel hover:bg-elevated hover:border-white/20 transition-all duration-300;
+  }
+
+  /* Trading Cards */
+  .trade-card {
+    @apply bg-panel border border-white/10 rounded-xl transition-all duration-300;
+  }
+  .trade-card:hover {
+    @apply border-white/20 shadow-lg shadow-black/20;
+  }
+
+  /* Buttons */
+  .btn-primary {
+    @apply px-6 py-3 rounded-lg text-white font-semibold text-sm
+           transition-all duration-300
+           active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-brand/50;
+    background-image: linear-gradient(135deg, #22D3EE 0%, #8B5CF6 55%, #EC4899 100%);
+    background-size: 200% 200%;
+    background-position: 0% 50%;
+  }
+  .btn-primary:hover {
+    background-position: 100% 50%;
+    box-shadow: 0 0 30px rgba(139, 92, 246, 0.45), 0 0 60px rgba(236, 72, 153, 0.25);
+  }
+  .btn-secondary {
+    @apply px-6 py-3 rounded-lg bg-white/5 border border-white/10 text-white font-medium text-sm
+           hover:bg-white/10 hover:border-white/20 transition-all duration-300;
+  }
+  .btn-buy {
+    @apply px-6 py-3 rounded-xl bg-buy/10 border border-buy/30 text-buy font-bold text-sm
+           hover:bg-buy/20 hover:border-buy transition-all duration-300
+           hover:shadow-[0_0_30px_rgba(0,191,165,0.3)] active:scale-[0.98];
+  }
+  .btn-sell {
+    @apply px-6 py-3 rounded-xl bg-sell/10 border border-sell/30 text-sell font-bold text-sm
+           hover:bg-sell/20 hover:border-sell transition-all duration-300
+           hover:shadow-[0_0_30px_rgba(229,57,53,0.3)] active:scale-[0.98];
+  }
+
+  /* Input Fields */
+  .input-field {
+    @apply w-full bg-elevated border border-white/10 rounded-lg py-2.5 px-4
+           text-sm text-white placeholder:text-gray-500
+           focus:outline-none focus:border-brand focus:ring-1 focus:ring-brand
+           transition-all duration-300;
+  }
+
+  /* Cards */
+  .card-neo {
+    @apply bg-panel border border-white/10 rounded-xl p-4;
+  }
+  .stat-card {
+    @apply bg-panel border border-white/10 rounded-xl p-4 border-l-2;
+  }
+
+  /* Navigation */
+  .nav-link {
+    @apply px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors duration-200;
+  }
+  .nav-link-active {
+    @apply px-4 py-2 text-sm text-brand font-medium;
+  }
+
+  /* Badges */
+  .badge-neo {
+    @apply px-2 py-0.5 rounded text-xs font-medium;
+  }
+  .badge-success { @apply badge-neo bg-buy/20 text-buy border border-buy/20; }
+  .badge-warning { @apply badge-neo bg-amber/20 text-amber border border-amber/20; }
+  .badge-danger  { @apply badge-neo bg-sell/20 text-sell border border-sell/20; }
+  .badge-info    { @apply badge-neo bg-brand/20 text-brand border border-brand/20; }
+
+  /* Feature Cards */
+  .feature-card {
+    @apply bg-panel/50 border border-white/5 rounded-2xl p-6 md:p-8
+           hover:border-brand/30 hover:bg-panel transition-all duration-500
+           hover:shadow-[0_0_60px_rgba(139,92,246,0.15)];
+  }
+
+  /* Hero Section */
+  .hero-gradient {
+    background: radial-gradient(ellipse at 20% 20%, rgba(34,211,238,0.12) 0%, transparent 55%),
+                radial-gradient(ellipse at 80% 30%, rgba(139,92,246,0.18) 0%, transparent 55%),
+                radial-gradient(ellipse at 50% 90%, rgba(236,72,153,0.14) 0%, transparent 55%);
+  }
+}
+
+@layer utilities {
+  /* Gradients */
+  .text-gradient {
+    @apply text-transparent bg-clip-text;
+    background-image: linear-gradient(135deg, #22D3EE 0%, #8B5CF6 50%, #EC4899 100%);
+  }
+  .text-gradient-brand {
+    @apply text-transparent bg-clip-text;
+    background-image: linear-gradient(135deg, #22D3EE 0%, #8B5CF6 50%, #EC4899 100%);
+    background-size: 200% auto;
+    animation: gradientShift 8s ease infinite;
+  }
+  .bg-gradient-brand {
+    background-image: linear-gradient(135deg, #22D3EE 0%, #8B5CF6 50%, #EC4899 100%);
+  }
+
+  /* Glows */
+  .glow-brand {
+    box-shadow: 0 0 30px rgba(139, 92, 246, 0.45), 0 0 60px rgba(236, 72, 153, 0.2);
+  }
+  .glow-buy { box-shadow: 0 0 30px rgba(0, 191, 165, 0.4); }
+  .glow-sell { box-shadow: 0 0 30px rgba(229, 57, 53, 0.4); }
+
+  /* Ambient Background */
+  .ambient-bg { position: relative; }
+  .ambient-bg::before {
+    content: '';
+    position: absolute;
+    top: -20%; left: -10%;
+    width: 50%; height: 50%;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.12) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: -1;
+  }
+  .ambient-bg::after {
+    content: '';
+    position: absolute;
+    bottom: -20%; right: -10%;
+    width: 60%; height: 60%;
+    background: radial-gradient(circle, rgba(236, 72, 153, 0.10) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  /* Scrollbar (NeoTrade flavor) */
+  .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(139, 92, 246, 0.35);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(236, 72, 153, 0.5);
+  }
+
+  /* 3D */
+  .preserve-3d { transform-style: preserve-3d; }
+  .perspective-1000 { perspective: 1000px; }
+
+  @keyframes gradientShift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+}
+
+/* Range Slider (NeoTrade) */
+.neo-range[type="range"] {
+  @apply w-full h-2 bg-white/10 rounded-full appearance-none cursor-pointer;
+}
+.neo-range[type="range"]::-webkit-slider-thumb {
+  @apply appearance-none w-5 h-5 rounded-full cursor-pointer
+         shadow-[0_0_15px_rgba(139,92,246,0.55)]
+         transition-all;
+  background: linear-gradient(135deg, #22D3EE, #8B5CF6, #EC4899);
+}
+.neo-range[type="range"]::-moz-range-thumb {
+  @apply w-5 h-5 rounded-full cursor-pointer border-0
+         shadow-[0_0_15px_rgba(139,92,246,0.55)]
+         transition-all;
+  background: linear-gradient(135deg, #22D3EE, #8B5CF6, #EC4899);
+}
+
+/* Selection */
+.neo-page ::selection {
+  background-color: rgba(139, 92, 246, 0.4);
+  color: white;
+}
+
+/* Toggle Switch */
+.toggle-switch { @apply relative inline-flex items-center cursor-pointer; }
+.toggle-switch input { @apply sr-only; }
+.toggle-slider {
+  @apply w-10 h-6 bg-white/10 rounded-full
+         after:content-[''] after:absolute after:top-[3px] after:left-[3px]
+         after:bg-white after:rounded-full after:h-[18px] after:w-[18px]
+         after:transition-all;
+}
+.toggle-switch input:checked + .toggle-slider {
+  @apply bg-buy shadow-[0_0_15px_rgba(0,191,165,0.3)];
+}
+.toggle-switch input:checked + .toggle-slider::after { @apply translate-x-4; }
+
+/* Animation Classes */
+.animate-in { animation: slideInUp 0.6s ease-out forwards; }
+@keyframes slideInUp {
+  0% { opacity: 0; transform: translateY(30px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.delay-100 { animation-delay: 0.1s; }
+.delay-200 { animation-delay: 0.2s; }
+.delay-300 { animation-delay: 0.3s; }
+.delay-400 { animation-delay: 0.4s; }
+.delay-500 { animation-delay: 0.5s; }
+
+/* Marquee for price ticker */
+@keyframes marquee {
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(-50%); }
+}
+.animate-marquee { animation: marquee 30s linear infinite; }
+.animate-marquee:hover { animation-play-state: paused; }
+
+/* NeoTrade public-page font binding — applied via `.neo-page` wrapper so dashboards stay untouched */
+.neo-page {
+  font-family: 'IBM Plex Sans', 'Inter', system-ui, sans-serif;
+}
+.neo-page h1, .neo-page h2, .neo-page h3,
+.neo-page h4, .neo-page h5, .neo-page h6 {
+  font-family: 'Outfit', 'Inter', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}

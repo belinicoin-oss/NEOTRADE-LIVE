@@ -1,0 +1,1435 @@
+import { NextResponse } from 'next/server';
+import { v4 as uuidv4 } from 'uuid';
+import { getDb } from '@/lib/db';
+import {
+  signToken,
+  verifyToken,
+  getTokenFromRequest,
+  getUserFromRequest,
+  ensureSeedUsers,
+  hashPassword,
+  comparePassword
+} from '@/lib/auth';
+import {
+  startEngine,
+  getAssets,
+  getAsset,
+  getCurrentPrice,
+  getCandles,
+  addStreamer
+} from '@/lib/priceEngine';
+import { startResolver } from '@/lib/tradeResolver';
+import { startLiveFeed } from '@/lib/liveFeed';
+import { sendEmail, generateOtp } from '@/lib/email';
+import {
+  tplSignupOtp,
+  tplWelcome,
+  tplPasswordReset,
+  tplLoginAlert,
+  tplDepositRequested,
+  tplDepositApproved,
+  tplDepositRejected,
+  tplWithdrawalRequested,
+  tplWithdrawalApproved,
+  tplWithdrawalRejected,
+} from '@/lib/emailTemplates';
+import {
+  ensureReferralCode,
+  resolveSponsorByCode,
+  evaluateUserLevel,
+  evaluateUpline,
+  creditDirectCommissionOnDeposit,
+  startSalaryScheduler,
+  runMonthlySalaryCheck,
+  getUserNetworkSummary,
+  generateReferralCode,
+} from '@/lib/networkEngine';
+
+// Boot once
+async function bootstrap() {
+  if (!global.__bootstrapped) {
+    global.__bootstrapped = true;
+    await ensureSeedUsers();
+    startEngine();
+    startResolver();
+    startLiveFeed();
+    startSalaryScheduler();
+  }
+}
+
+function json(data, status = 200) {
+  return NextResponse.json(data, { status });
+}
+
+// ──── Admin-configured global payout (cached for 2s) ────
+// Every asset's user-facing payout % is derived from the admin's
+// `settings.payoutRate` (e.g. 1.50x → 0.50 → 50%). This decouples the
+// hardcoded per-asset payouts in priceEngine.js / liveAssetsConfig.js
+// from what the user dashboard displays so any admin change propagates
+// across all symbols at once.
+let __payoutCache = { value: null, expires: 0 };
+async function getGlobalPayout() {
+  const now = Date.now();
+  if (__payoutCache.value !== null && __payoutCache.expires > now) {
+    return __payoutCache.value;
+  }
+  try {
+    const db = await getDb();
+    const s = await db.collection('settings').findOne({ id: 'global' });
+    const rate = Number(s?.payoutRate);
+    const payout = Number.isFinite(rate) && rate > 1 ? +(rate - 1).toFixed(4) : 0.8;
+    __payoutCache = { value: payout, expires: now + 2000 };
+    return payout;
+  } catch (_) {
+    return __payoutCache.value !== null ? __payoutCache.value : 0.8;
+  }
+}
+
+function publicUser(u) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    role: u.role,
+    demoBalance: u.demoBalance,
+    liveBalance: u.liveBalance,
+    networkBalance: Number(u.networkBalance || 0),
+    activeAccount: u.activeAccount,
+    prefs: u.prefs || {},
+    referralCode: u.referralCode || null,
+    referredBy: u.referredBy || null,
+    currentLevel: u.currentLevel || 0,
+    currentLevelName: u.currentLevelName || null,
+    currentSalary: Number(u.currentSalary || 0),
+  };
+}
+
+async function requireUser(req) {
+  const user = await getUserFromRequest(req);
+  return user;
+}
+
+async function handler(req, { params }) {
+  await bootstrap();
+  const segments = (params?.path || []);
+  const route = segments.join('/');
+  const method = req.method;
+  const db = await getDb();
+
+  try {
+    // ----- AUTH -----
+    if (route === 'auth/login' && method === 'POST') {
+      const { email, password } = await req.json();
+      const user = await db.collection('users').findOne({ email: (email || '').toLowerCase() });
+      if (!user) return json({ error: 'Invalid credentials' }, 401);
+      const ok = await comparePassword(password, user.passwordHash);
+      if (!ok) return json({ error: 'Invalid credentials' }, 401);
+      const token = signToken(user);
+
+      // Login-alert email (best-effort, fire-and-forget). Skipped for the
+      // seeded admin/master accounts so testing doesn't spam the inbox.
+      if (!['admin@trading.com', 'masteruser@trading.com'].includes(user.email)) {
+        const ua = req.headers.get('user-agent') || '';
+        const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+                || req.headers.get('x-real-ip') || 'unknown';
+        const { subject, html } = tplLoginAlert({
+          name: user.name, ip, userAgent: ua,
+          when: new Date().toUTCString(),
+        });
+        sendEmail({ to: user.email, subject, html, kind: 'login_alert' });
+      }
+
+      return json({ token, user: publicUser(user) });
+    }
+
+    // ----- SIGNUP (two-step with email OTP) -----
+    // Step 1: request an OTP. Stores pending signup details under the email
+    // (one pending signup per email at a time). Does NOT create the user.
+    if (route === 'auth/signup/request' && method === 'POST') {
+      const { email, password, name, referralCode } = await req.json();
+      if (!email || !password) return json({ error: 'Email and password required' }, 400);
+      if (String(password).length < 6) return json({ error: 'Password must be at least 6 characters' }, 400);
+      const lower = email.toLowerCase().trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lower)) return json({ error: 'Invalid email' }, 400);
+      const exists = await db.collection('users').findOne({ email: lower });
+      if (exists) return json({ error: 'An account with this email already exists' }, 400);
+
+      const code = generateOtp();
+      const codeHash = await hashPassword(code);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+      const displayName = String(name || lower.split('@')[0]).trim().slice(0, 60);
+
+      // Replace any prior pending row for this email
+      await db.collection('signup_otps').updateOne(
+        { email: lower },
+        { $set: {
+            email: lower,
+            name: displayName,
+            passwordHash: await hashPassword(password),
+            codeHash,
+            attempts: 0,
+            expiresAt,
+            referralCode: String(referralCode || '').trim().toUpperCase().slice(0, 16) || null,
+            createdAt: new Date(),
+          }
+        },
+        { upsert: true }
+      );
+
+      const { subject, html } = tplSignupOtp({ name: displayName, code });
+      sendEmail({ to: lower, subject, html, kind: 'signup_otp' });
+      return json({ ok: true, message: 'Verification code sent', expiresAt });
+    }
+
+    // Step 2: verify the OTP and create the user.
+    if (route === 'auth/signup/verify' && method === 'POST') {
+      const { email, code } = await req.json();
+      const lower = String(email || '').toLowerCase().trim();
+      if (!lower || !code) return json({ error: 'Email and code required' }, 400);
+      const pending = await db.collection('signup_otps').findOne({ email: lower });
+      if (!pending) return json({ error: 'No pending signup for this email. Request a new code.' }, 404);
+      if (pending.expiresAt && pending.expiresAt < new Date()) {
+        await db.collection('signup_otps').deleteOne({ email: lower });
+        return json({ error: 'Code expired. Request a new one.' }, 400);
+      }
+      if ((pending.attempts || 0) >= 6) {
+        return json({ error: 'Too many attempts. Request a new code.' }, 429);
+      }
+      const ok = await comparePassword(String(code), pending.codeHash);
+      if (!ok) {
+        await db.collection('signup_otps').updateOne({ email: lower }, { $inc: { attempts: 1 } });
+        return json({ error: 'Incorrect code' }, 400);
+      }
+
+      // Create the user
+      const exists = await db.collection('users').findOne({ email: lower });
+      if (exists) {
+        await db.collection('signup_otps').deleteOne({ email: lower });
+        return json({ error: 'Account already exists. Please log in.' }, 400);
+      }
+      const u = {
+        id: uuidv4(),
+        email: lower,
+        name: pending.name,
+        passwordHash: pending.passwordHash,
+        role: 'user',
+        demoBalance: 10000,
+        liveBalance: 0,
+        networkBalance: 0,
+        activeAccount: 'demo',
+        emailVerified: true,
+        emailVerifiedAt: new Date(),
+        createdAt: new Date()
+      };
+      // Resolve sponsor by referral code (if any)
+      const sponsorId = await resolveSponsorByCode(pending.referralCode);
+      if (sponsorId) u.referredBy = sponsorId;
+      // Auto-generate this user's own referral code
+      u.referralCode = generateReferralCode(u.id);
+      await db.collection('users').insertOne(u);
+      await db.collection('signup_otps').deleteOne({ email: lower });
+
+      // Re-evaluate sponsor & upline now that downline grew (even if no
+      // deposit yet — keeps direct-count metric fresh).
+      if (sponsorId) { evaluateUpline(u.id).catch(() => {}); }
+
+      const token = signToken(u);
+      const w = tplWelcome({ name: u.name });
+      sendEmail({ to: u.email, subject: w.subject, html: w.html, kind: 'welcome' });
+      return json({ token, user: publicUser(u) });
+    }
+
+    // ----- LEGACY signup (kept for any external test / older client) -----
+    // Now requires the OTP flow above. Returns 410 so callers update.
+    if (route === 'auth/signup' && method === 'POST') {
+      const { email, password, name, referralCode } = await req.json();
+      if (!email || !password) return json({ error: 'Email and password required' }, 400);
+      const lower = email.toLowerCase();
+      const exists = await db.collection('users').findOne({ email: lower });
+      if (exists) return json({ error: 'User already exists' }, 400);
+      const sponsorId = await resolveSponsorByCode(referralCode);
+      const u = {
+        id: uuidv4(),
+        email: lower,
+        name: name || lower.split('@')[0],
+        passwordHash: await hashPassword(password),
+        role: 'user',
+        demoBalance: 10000,
+        liveBalance: 0,
+        networkBalance: 0,
+        activeAccount: 'demo',
+        referralCode: generateReferralCode(uuidv4()),
+        referredBy: sponsorId || undefined,
+        createdAt: new Date()
+      };
+      await db.collection('users').insertOne(u);
+      if (sponsorId) { evaluateUpline(u.id).catch(() => {}); }
+      const token = signToken(u);
+      return json({ token, user: publicUser(u) });
+    }
+
+    // ----- PASSWORD RESET (forgot password) -----
+    // Step 1: request a reset code. Always returns ok so we don't leak which
+    // emails are registered.
+    if (route === 'auth/password/request' && method === 'POST') {
+      const { email } = await req.json();
+      const lower = String(email || '').toLowerCase().trim();
+      const user = lower ? await db.collection('users').findOne({ email: lower }) : null;
+      if (user) {
+        const code = generateOtp();
+        const codeHash = await hashPassword(code);
+        const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+        await db.collection('password_resets').updateOne(
+          { email: lower },
+          { $set: { email: lower, userId: user.id, codeHash, attempts: 0, expiresAt, createdAt: new Date() } },
+          { upsert: true }
+        );
+        const link = `${(process.env.APP_BRAND_URL || process.env.NEXT_PUBLIC_APP_URL || '').replace(/\/$/, '')}/reset-password?email=${encodeURIComponent(lower)}`;
+        const { subject, html } = tplPasswordReset({ name: user.name, code, link });
+        sendEmail({ to: lower, subject, html, kind: 'password_reset' });
+      }
+      return json({ ok: true });
+    }
+
+    // Step 2: verify reset code + set new password.
+    if (route === 'auth/password/reset' && method === 'POST') {
+      const { email, code, newPassword } = await req.json();
+      const lower = String(email || '').toLowerCase().trim();
+      if (!lower || !code || !newPassword) return json({ error: 'Missing fields' }, 400);
+      if (String(newPassword).length < 6) return json({ error: 'New password must be at least 6 characters' }, 400);
+      const row = await db.collection('password_resets').findOne({ email: lower });
+      if (!row) return json({ error: 'Invalid or expired code' }, 400);
+      if (row.expiresAt && row.expiresAt < new Date()) {
+        await db.collection('password_resets').deleteOne({ email: lower });
+        return json({ error: 'Code expired. Request a new one.' }, 400);
+      }
+      if ((row.attempts || 0) >= 6) {
+        return json({ error: 'Too many attempts. Request a new code.' }, 429);
+      }
+      const ok = await comparePassword(String(code), row.codeHash);
+      if (!ok) {
+        await db.collection('password_resets').updateOne({ email: lower }, { $inc: { attempts: 1 } });
+        return json({ error: 'Incorrect code' }, 400);
+      }
+      const newHash = await hashPassword(String(newPassword));
+      await db.collection('users').updateOne(
+        { id: row.userId },
+        { $set: { passwordHash: newHash, passwordUpdatedAt: new Date() } }
+      );
+      await db.collection('password_resets').deleteOne({ email: lower });
+      return json({ ok: true });
+    }
+
+    if (route === 'auth/me' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      return json({ user: publicUser(u) });
+    }
+
+    if (route === 'auth/switch' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { account } = await req.json();
+      if (!['demo', 'live'].includes(account)) return json({ error: 'invalid' }, 400);
+      await db.collection('users').updateOne({ id: u.id }, { $set: { activeAccount: account } });
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      return json({ user: publicUser(fresh) });
+    }
+
+    // Reset demo balance
+    if (route === 'auth/reset-demo' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      await db.collection('users').updateOne({ id: u.id }, { $set: { demoBalance: 10000 } });
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      return json({ user: publicUser(fresh) });
+    }
+
+    if (route === 'auth/change-password' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { currentPassword, newPassword } = await req.json();
+      if (!currentPassword || !newPassword) {
+        return json({ error: 'currentPassword and newPassword are required' }, 400);
+      }
+      if (String(newPassword).length < 6) {
+        return json({ error: 'New password must be at least 6 characters' }, 400);
+      }
+      const ok = await comparePassword(currentPassword, u.passwordHash);
+      if (!ok) return json({ error: 'Current password is incorrect' }, 401);
+      const newHash = await hashPassword(newPassword);
+      await db.collection('users').updateOne(
+        { id: u.id },
+        { $set: { passwordHash: newHash, passwordUpdatedAt: new Date() } }
+      );
+      return json({ ok: true });
+    }
+
+    if (route === 'auth/profile' && method === 'PUT') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { name } = await req.json();
+      const trimmed = typeof name === 'string' ? name.trim() : '';
+      if (!trimmed) return json({ error: 'Name is required' }, 400);
+      await db.collection('users').updateOne(
+        { id: u.id },
+        { $set: { name: trimmed } }
+      );
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      return json({ user: publicUser(fresh) });
+    }
+
+    // Persisted user preferences (last asset, last interval, last trade size,
+    // etc.). Saved automatically by the trade page so that on next login
+    // the workspace re-opens exactly where the trader left off.
+    if (route === 'auth/prefs' && method === 'PUT') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const body = await req.json().catch(() => ({}));
+      const allowed = ['lastAsset', 'lastInterval', 'lastDuration', 'lastAmount', 'lastAssetTab'];
+      const update = {};
+      for (const k of allowed) {
+        if (body[k] === undefined) continue;
+        const v = body[k];
+        if (k === 'lastAsset')      update[`prefs.${k}`] = String(v).slice(0, 32);
+        else if (k === 'lastAssetTab') update[`prefs.${k}`] = ['otc','live'].includes(v) ? v : 'otc';
+        else if (k === 'lastInterval') update[`prefs.${k}`] = Math.max(5, Math.min(600, Number(v) || 5));
+        else if (k === 'lastDuration') update[`prefs.${k}`] = Math.max(5, Math.min(1800, Math.floor(Number(v) || 60)));
+        else if (k === 'lastAmount')   update[`prefs.${k}`] = Math.max(1, Math.min(100000, Math.floor(Number(v) || 1)));
+      }
+      if (Object.keys(update).length === 0) return json({ ok: true, prefs: u.prefs || {} });
+      await db.collection('users').updateOne({ id: u.id }, { $set: update });
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      return json({ ok: true, prefs: fresh.prefs || {} });
+    }
+
+    // ----- MARKET DATA -----
+    if (route === 'assets' && method === 'GET') {
+      const payout = await getGlobalPayout();
+      // Filter out admin-disabled assets for non-admins. Admins always see
+      // the full list (so they can re-enable disabled symbols).
+      const url = new URL(req.url);
+      const includeAll = url.searchParams.get('all') === '1';
+      let disabled = [];
+      if (!includeAll) {
+        try {
+          const s = await db.collection('settings').findOne({ id: 'global' });
+          disabled = Array.isArray(s?.disabledAssets) ? s.disabledAssets : [];
+        } catch {}
+      }
+      const assets = getAssets()
+        .filter(a => includeAll || !disabled.includes(a.symbol))
+        .map(a => ({ ...a, payout }));
+      return json({ assets });
+    }
+
+    // ----- PAYMENT METHODS (public) -----
+    // Returns only enabled methods. Used by the deposit / withdrawal modals.
+    if (route === 'payment-methods' && method === 'GET') {
+      const url = new URL(req.url);
+      const kind = url.searchParams.get('kind'); // 'deposit' | 'withdrawal' | null
+      const s = await db.collection('settings').findOne({ id: 'global' });
+      const all = Array.isArray(s?.paymentMethods) ? s.paymentMethods : [];
+      const list = all
+        .filter(m => m && m.enabled !== false)
+        .filter(m => !kind || m.type === kind || m.type === 'both' || !m.type);
+      return json({ methods: list });
+    }
+
+    if (segments[0] === 'price' && segments[1] && method === 'GET') {
+      const sym = segments[1];
+      const a = getAsset(sym);
+      if (!a) return json({ error: 'unknown asset' }, 404);
+      const payout = await getGlobalPayout();
+      return json({ symbol: sym, price: a.price, decimals: a.decimals, payout, t: Date.now() });
+    }
+
+    if (segments[0] === 'candles' && segments[1] && method === 'GET') {
+      const sym = segments[1];
+      const url = new URL(req.url);
+      const interval = parseInt(url.searchParams.get('interval') || '5');
+      const a = getAsset(sym);
+      if (!a) return json({ error: 'unknown asset' }, 404);
+      const candles = getCandles(sym, interval);
+      const payout = await getGlobalPayout();
+      return json({ symbol: sym, interval, decimals: a.decimals, payout, candles, support: a.support, resistance: a.resistance, kind: a.kind });
+    }
+
+    // ----- REAL-TIME PRICE STREAM (Server-Sent Events) -----
+    if (segments[0] === 'stream' && segments[1] && method === 'GET') {
+      const sym = segments[1];
+      const a = getAsset(sym);
+      if (!a) return new Response('not found', { status: 404 });
+
+      const encoder = new TextEncoder();
+      let unsub = () => {};
+      let pingTimer = null;
+
+      const stream = new ReadableStream({
+        start(controller) {
+          let alive = true;
+          const send = (obj) => {
+            if (!alive) return;
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            } catch (e) { alive = false; }
+          };
+          // Initial snapshot — payout overridden with admin's global rate.
+          getGlobalPayout().then(payout => {
+            send({ type: 'snapshot', symbol: sym, price: a.price, decimals: a.decimals, payout, kind: a.kind, t: Date.now() });
+          });
+          // Keep-alive ping (also flushes any buffered proxy)
+          pingTimer = setInterval(() => send({ type: 'ping', t: Date.now() }), 15000);
+          // Subscribe to engine ticks
+          unsub = addStreamer(sym, send);
+          // Cleanup on client disconnect
+          const cleanup = () => {
+            alive = false;
+            if (pingTimer) clearInterval(pingTimer);
+            try { unsub(); } catch {}
+            try { controller.close(); } catch {}
+          };
+          if (req.signal) req.signal.addEventListener('abort', cleanup);
+        },
+        cancel() {
+          if (pingTimer) clearInterval(pingTimer);
+          try { unsub(); } catch {}
+        }
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store, no-transform',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no'
+        }
+      });
+    }
+
+    // ----- TRADES -----
+    if (route === 'trades' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { asset, direction, amount, durationSec } = await req.json();
+      if (!['up', 'down'].includes(direction)) return json({ error: 'bad direction' }, 400);
+      const amt = Number(amount);
+      if (!(amt > 0)) return json({ error: 'bad amount' }, 400);
+      const dur = Math.max(5, Math.min(3600, parseInt(durationSec || 60)));
+      const a = getAsset(asset);
+      if (!a) return json({ error: 'bad asset' }, 400);
+
+      // Reject trades on admin-disabled assets (defensive — UI already hides
+      // them, but a stale client could still submit).
+      if (u.role !== 'admin') {
+        try {
+          const s = await db.collection('settings').findOne({ id: 'global' });
+          const disabled = Array.isArray(s?.disabledAssets) ? s.disabledAssets : [];
+          if (disabled.includes(asset)) {
+            return json({ error: 'This market is currently unavailable' }, 400);
+          }
+        } catch {}
+      }
+
+      const account = u.activeAccount || 'demo';
+      const balField = account === 'demo' ? 'demoBalance' : 'liveBalance';
+      if ((u[balField] || 0) < amt) {
+        return json({ error: 'Insufficient balance' }, 400);
+      }
+
+      // deduct stake
+      await db.collection('users').updateOne({ id: u.id }, { $inc: { [balField]: -amt } });
+
+      const now = new Date();
+      const trade = {
+        id: uuidv4(),
+        userId: u.id,
+        userEmail: u.email,
+        asset,
+        direction,
+        amount: amt,
+        account,
+        entryPrice: a.price,
+        durationSec: dur,
+        openedAt: now,
+        expiresAt: new Date(now.getTime() + dur * 1000),
+        status: 'open',
+        outcome: null,
+        forceOutcome: null,
+        payout: 0,
+        pnl: 0,
+        wedgeApplied: false
+      };
+      await db.collection('trades').insertOne(trade);
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      return json({ trade, user: publicUser(fresh) });
+    }
+
+    if (route === 'trades' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const url = new URL(req.url);
+      const status = url.searchParams.get('status'); // open|closed|all
+      const q = { userId: u.id };
+      if (status && status !== 'all') q.status = status;
+      const trades = await db.collection('trades').find(q).sort({ openedAt: -1 }).limit(100).toArray();
+      return json({ trades });
+    }
+
+    // ----- DEPOSITS / WITHDRAWALS -----
+    if (route === 'deposits' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { amount, method: payMethod, methodData } = await req.json();
+      const amt = Number(amount);
+      if (!(amt > 0)) return json({ error: 'invalid amount' }, 400);
+      if (!payMethod) return json({ error: 'method required' }, 400);
+      const set = await db.collection('settings').findOne({ id: 'global' });
+      const minDep = Number(set?.minDeposit || 10);
+      if (amt < minDep) return json({ error: `Minimum deposit is $${minDep}` }, 400);
+      const dep = {
+        id: uuidv4(),
+        userId: u.id,
+        userEmail: u.email,
+        type: 'deposit',
+        amount: amt,
+        method: payMethod,
+        methodData: methodData || {},
+        status: 'pending',
+        createdAt: new Date(),
+        adminNote: null,
+        resolvedAt: null
+      };
+      await db.collection('deposit_requests').insertOne(dep);
+      const _dr = tplDepositRequested({
+        name: u.name, amount: amt, method: payMethod,
+        ref: dep.id.slice(0, 8).toUpperCase(),
+      });
+      sendEmail({ to: u.email, subject: _dr.subject, html: _dr.html, kind: 'deposit_requested' });
+      return json({ deposit: dep });
+    }
+
+    if (route === 'deposits' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const list = await db.collection('deposit_requests').find({ userId: u.id }).sort({ createdAt: -1 }).limit(50).toArray();
+      return json({ deposits: list });
+    }
+
+    if (route === 'withdrawals' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const { amount, method: payMethod, methodData, source } = await req.json();
+      const amt = Number(amount);
+      if (!(amt > 0)) return json({ error: 'invalid amount' }, 400);
+      if (!payMethod) return json({ error: 'method required' }, 400);
+      const set = await db.collection('settings').findOne({ id: 'global' });
+      const minWd = Number(set?.minWithdrawal || 10);
+      if (amt < minWd) return json({ error: `Minimum withdrawal is $${minWd}` }, 400);
+      // Source selector: 'trading' (default — liveBalance) or 'network' (networkBalance)
+      const src = source === 'network' ? 'network' : 'trading';
+      const balField = src === 'network' ? 'networkBalance' : 'liveBalance';
+      const have = Number(u[balField] || 0);
+      if (have < amt) return json({ error: `Insufficient ${src === 'network' ? 'network' : 'live'} balance` }, 400);
+      // Escrow: deduct now, refund on reject
+      await db.collection('users').updateOne({ id: u.id }, { $inc: { [balField]: -amt } });
+      const wd = {
+        id: uuidv4(),
+        userId: u.id,
+        userEmail: u.email,
+        type: 'withdrawal',
+        amount: amt,
+        method: payMethod,
+        methodData: methodData || {},
+        source: src,
+        status: 'pending',
+        createdAt: new Date(),
+        adminNote: null,
+        resolvedAt: null
+      };
+      await db.collection('withdrawal_requests').insertOne(wd);
+      // Mirror to network ledger so the user's network transaction history
+      // reflects pending payouts immediately.
+      if (src === 'network') {
+        await db.collection('network_transactions').insertOne({
+          id: uuidv4(),
+          userId: u.id,
+          type: 'withdrawal',
+          amount: -amt,
+          description: `Withdrawal request to ${payMethod}`,
+          reference: `WD-${wd.id.slice(0, 8).toUpperCase()}`,
+          refWithdrawalId: wd.id,
+          status: 'pending',
+          createdAt: new Date(),
+        });
+      }
+      const fresh = await db.collection('users').findOne({ id: u.id });
+      const _wr = tplWithdrawalRequested({
+        name: u.name, amount: amt, method: payMethod,
+        ref: wd.id.slice(0, 8).toUpperCase(),
+      });
+      sendEmail({ to: u.email, subject: _wr.subject, html: _wr.html, kind: 'withdrawal_requested' });
+      return json({ withdrawal: wd, user: publicUser(fresh) });
+    }
+
+    if (route === 'withdrawals' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'Unauthorized' }, 401);
+      const list = await db.collection('withdrawal_requests').find({ userId: u.id }).sort({ createdAt: -1 }).limit(50).toArray();
+      return json({ withdrawals: list });
+    }
+
+    // ----- ADMIN -----
+    if (segments[0] === 'admin') {
+      const u = await requireUser(req);
+      if (!u || u.role !== 'admin') return json({ error: 'forbidden' }, 403);
+
+      if (route === 'admin/users' && method === 'GET') {
+        const users = await db.collection('users').find({}, { projection: { passwordHash: 0 } }).toArray();
+        return json({ users });
+      }
+
+      if (route === 'admin/trades' && method === 'GET') {
+        const url = new URL(req.url);
+        const status = url.searchParams.get('status') || 'open';
+        const q = status === 'all' ? {} : { status };
+        const trades = await db.collection('trades').find(q).sort({ openedAt: -1 }).limit(200).toArray();
+        return json({ trades });
+      }
+
+      if (segments[0] === 'admin' && segments[1] === 'trades' && segments[2] && segments[3] === 'force' && method === 'POST') {
+        const tradeId = segments[2];
+        const { outcome } = await req.json();
+        if (!['win', 'loss', null, ''].includes(outcome)) return json({ error: 'bad outcome' }, 400);
+        await db.collection('trades').updateOne(
+          { id: tradeId, status: 'open' },
+          { $set: { forceOutcome: outcome || null } }
+        );
+        const trade = await db.collection('trades').findOne({ id: tradeId });
+        return json({ trade });
+      }
+
+      if (route === 'admin/settings' && method === 'GET') {
+        const s = await db.collection('settings').findOne({ id: 'global' });
+        return json({ settings: s });
+      }
+
+      // Email log — last 100 send attempts (admin-only) for diagnostics.
+      if (route === 'admin/emails' && method === 'GET') {
+        const list = await db.collection('email_log')
+          .find({}, { projection: { _id: 0 } })
+          .sort({ createdAt: -1 })
+          .limit(100)
+          .toArray();
+        return json({ emails: list });
+      }
+
+      if (route === 'admin/settings' && method === 'PUT') {
+        const body = await req.json();
+        const update = {};
+        if (body.winRatio !== undefined) update.winRatio = Math.max(0, Math.min(1, Number(body.winRatio)));
+        if (body.payoutRate !== undefined) update.payoutRate = Math.max(1, Math.min(5, Number(body.payoutRate)));
+        if (body.manipulationEnabled !== undefined) update.manipulationEnabled = !!body.manipulationEnabled;
+        if (body.bigWinInjection !== undefined) update.bigWinInjection = !!body.bigWinInjection;
+        if (body.dailyProfitTarget !== undefined) update.dailyProfitTarget = Number(body.dailyProfitTarget) || 0;
+        if (body.safetyNet !== undefined) update.safetyNet = Number(body.safetyNet) || 0;
+        if (body.tradePattern !== undefined) update.tradePattern = String(body.tradePattern || '').toUpperCase().slice(0, 32);
+        if (body.minDeposit !== undefined) update.minDeposit = Math.max(1, Number(body.minDeposit) || 10);
+        if (body.minWithdrawal !== undefined) update.minWithdrawal = Math.max(1, Number(body.minWithdrawal) || 10);
+
+        // --- Markets: admin-disabled symbols (string[]) ---
+        if (body.disabledAssets !== undefined) {
+          const arr = Array.isArray(body.disabledAssets) ? body.disabledAssets : [];
+          update.disabledAssets = arr
+            .map(s => String(s || '').toUpperCase().slice(0, 32))
+            .filter(Boolean)
+            .slice(0, 500);
+        }
+
+        // --- Payment methods (CRUD'd as a single array from admin) ---
+        if (body.paymentMethods !== undefined) {
+          const raw = Array.isArray(body.paymentMethods) ? body.paymentMethods : [];
+          update.paymentMethods = raw.slice(0, 50).map(m => ({
+            id: String(m?.id || uuidv4()).slice(0, 64),
+            name: String(m?.name || '').trim().slice(0, 80),
+            identifier: String(m?.identifier || '').trim().slice(0, 200),
+            recipient: String(m?.recipient || '').trim().slice(0, 120),
+            instructions: String(m?.instructions || '').trim().slice(0, 1000),
+            type: ['deposit', 'withdrawal', 'both'].includes(m?.type) ? m.type : 'both',
+            enabled: m?.enabled !== false,
+          })).filter(m => m.name);
+        }
+        // --- Network compensation engine settings ---
+        if (body.network !== undefined && body.network && typeof body.network === 'object') {
+          const n = body.network;
+          const out = {};
+          if (n.salaryDay !== undefined) {
+            const d = parseInt(n.salaryDay); out.salaryDay = Number.isFinite(d) ? Math.max(1, Math.min(28, d)) : 5;
+          }
+          if (n.minPaidDepositThreshold !== undefined) out.minPaidDepositThreshold = Math.max(0, Number(n.minPaidDepositThreshold) || 0);
+          if (n.directCommissionEnabled !== undefined) out.directCommissionEnabled = !!n.directCommissionEnabled;
+          if (n.directCommissionPercent !== undefined) out.directCommissionPercent = Math.max(0, Math.min(100, Number(n.directCommissionPercent) || 0));
+          if (n.directCommissionMinDeposit !== undefined) out.directCommissionMinDeposit = Math.max(0, Number(n.directCommissionMinDeposit) || 0);
+          // Merge — never wipe other network fields
+          const cur = (await db.collection('settings').findOne({ id: 'global' }))?.network || {};
+          update.network = { ...cur, ...out };
+        }
+        update.updatedAt = new Date();
+
+        // If the trade pattern was changed, reset every user's per-user
+        // patternIndex so the NEW pattern restarts from position 1 for
+        // everyone (instead of resuming mid-cycle from the previous one).
+        const currentSettings = await db.collection('settings').findOne({ id: 'global' });
+        const patternChanged =
+          body.tradePattern !== undefined &&
+          (currentSettings?.tradePattern || '') !== update.tradePattern;
+
+        await db.collection('settings').updateOne({ id: 'global' }, { $set: update }, { upsert: true });
+
+        if (patternChanged) {
+          await db.collection('users').updateMany({}, { $set: { patternIndex: 0 } });
+        }
+
+        const s = await db.collection('settings').findOne({ id: 'global' });
+        return json({ settings: s });
+      }
+
+      if (segments[0] === 'admin' && segments[1] === 'users' && segments[2] && segments[3] === 'balance' && method === 'POST') {
+        const userId = segments[2];
+        const { delta, account } = await req.json();
+        const field = account === 'live' ? 'liveBalance' : 'demoBalance';
+        await db.collection('users').updateOne({ id: userId }, { $inc: { [field]: Number(delta) } });
+        const fresh = await db.collection('users').findOne({ id: userId });
+        return json({ user: publicUser(fresh) });
+      }
+
+      if (route === 'admin/stats' && method === 'GET') {
+        const totalUsers = await db.collection('users').countDocuments({});
+        const openTrades = await db.collection('trades').countDocuments({ status: 'open' });
+        const closedTrades = await db.collection('trades').countDocuments({ status: 'closed' });
+        const wins = await db.collection('trades').countDocuments({ outcome: 'win' });
+        const losses = await db.collection('trades').countDocuments({ outcome: 'loss' });
+        const pendingDeposits = await db.collection('deposit_requests').countDocuments({ status: 'pending' });
+        const pendingWithdrawals = await db.collection('withdrawal_requests').countDocuments({ status: 'pending' });
+
+        // Aggregations: total approved deposit / withdraw amounts
+        const depAgg = await db.collection('deposit_requests').aggregate([
+          { $match: { status: 'approved' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]).toArray();
+        const wdAgg = await db.collection('withdrawal_requests').aggregate([
+          { $match: { status: 'approved' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]).toArray();
+        // Sum of every user's live balance => money currently in user wallets
+        const balAgg = await db.collection('users').aggregate([
+          { $group: { _id: null, total: { $sum: '$liveBalance' } } }
+        ]).toArray();
+        // Net P/L from house perspective = -SUM(pnl) on closed live trades.
+        // Users winning => house loses. House profit = sum of stakes on losses
+        // minus payouts on wins. We approximate via -1 * sum(user pnl on live).
+        const pnlAgg = await db.collection('trades').aggregate([
+          { $match: { status: 'closed', account: 'live' } },
+          { $group: { _id: null, total: { $sum: '$pnl' } } }
+        ]).toArray();
+
+        const totalDeposit = depAgg[0]?.total || 0;
+        const totalWithdraw = wdAgg[0]?.total || 0;
+        const activeBalance = balAgg[0]?.total || 0;
+        const totalProfit = -1 * (pnlAgg[0]?.total || 0);
+
+        return json({
+          totalUsers, openTrades, closedTrades, wins, losses,
+          pendingDeposits, pendingWithdrawals,
+          totalDeposit, totalWithdraw, activeBalance, totalProfit,
+        });
+      }
+
+      // Deposit/Withdrawal management
+      if (route === 'admin/deposits' && method === 'GET') {
+        const url = new URL(req.url);
+        const status = url.searchParams.get('status') || 'pending';
+        const q = status === 'all' ? {} : { status };
+        const list = await db.collection('deposit_requests').find(q).sort({ createdAt: -1 }).limit(200).toArray();
+        return json({ deposits: list });
+      }
+      if (route === 'admin/withdrawals' && method === 'GET') {
+        const url = new URL(req.url);
+        const status = url.searchParams.get('status') || 'pending';
+        const q = status === 'all' ? {} : { status };
+        const list = await db.collection('withdrawal_requests').find(q).sort({ createdAt: -1 }).limit(200).toArray();
+        return json({ withdrawals: list });
+      }
+
+      if (segments[0] === 'admin' && segments[1] === 'deposits' && segments[2] && segments[3] && method === 'POST') {
+        const id = segments[2];
+        const action = segments[3]; // 'approve' | 'reject'
+        const body = await req.json().catch(() => ({}));
+        const dep = await db.collection('deposit_requests').findOne({ id });
+        if (!dep) return json({ error: 'not found' }, 404);
+        if (dep.status !== 'pending') return json({ error: 'already processed' }, 400);
+        if (action === 'approve') {
+          await db.collection('users').updateOne({ id: dep.userId }, { $inc: { liveBalance: dep.amount } });
+          await db.collection('deposit_requests').updateOne({ id }, { $set: { status: 'approved', resolvedAt: new Date(), adminNote: body.note || null } });
+          // ── Network engine hook (fire-and-forget — never blocks the
+          //    deposit-approve flow even if compensation has bugs) ──
+          try {
+            const fresh = await db.collection('deposit_requests').findOne({ id });
+            await creditDirectCommissionOnDeposit(fresh);
+            await evaluateUpline(dep.userId);
+            // Also re-evaluate the depositor (in case they qualify too)
+            await evaluateUserLevel(dep.userId);
+          } catch (e) { /* compensation errors must not break deposits */ }
+        } else if (action === 'reject') {
+          await db.collection('deposit_requests').updateOne({ id }, { $set: { status: 'rejected', resolvedAt: new Date(), adminNote: body.note || null } });
+        } else {
+          return json({ error: 'bad action' }, 400);
+        }
+        const fresh = await db.collection('deposit_requests').findOne({ id });
+        // Notify user
+        try {
+          const targetUser = await db.collection('users').findOne({ id: dep.userId });
+          if (targetUser?.email) {
+            const tpl = action === 'approve'
+              ? tplDepositApproved({ name: targetUser.name, amount: dep.amount, method: dep.method, ref: dep.id.slice(0, 8).toUpperCase() })
+              : tplDepositRejected({ name: targetUser.name, amount: dep.amount, method: dep.method, ref: dep.id.slice(0, 8).toUpperCase(), note: body.note });
+            sendEmail({ to: targetUser.email, subject: tpl.subject, html: tpl.html, kind: `deposit_${action === 'approve' ? 'approved' : 'rejected'}` });
+          }
+        } catch {}
+        return json({ deposit: fresh });
+      }
+
+      if (segments[0] === 'admin' && segments[1] === 'withdrawals' && segments[2] && segments[3] && method === 'POST') {
+        const id = segments[2];
+        const action = segments[3];
+        const body = await req.json().catch(() => ({}));
+        const wd = await db.collection('withdrawal_requests').findOne({ id });
+        if (!wd) return json({ error: 'not found' }, 404);
+        if (wd.status !== 'pending') return json({ error: 'already processed' }, 400);
+        if (action === 'approve') {
+          // Funds were already escrowed at request time; just mark approved
+          await db.collection('withdrawal_requests').updateOne({ id }, { $set: { status: 'approved', resolvedAt: new Date(), adminNote: body.note || null } });
+          if (wd.source === 'network') {
+            await db.collection('network_transactions').updateMany(
+              { refWithdrawalId: wd.id, type: 'withdrawal' },
+              { $set: { status: 'completed' } }
+            );
+          }
+        } else if (action === 'reject') {
+          // Refund the amount back to the source wallet
+          const balField = wd.source === 'network' ? 'networkBalance' : 'liveBalance';
+          await db.collection('users').updateOne({ id: wd.userId }, { $inc: { [balField]: wd.amount } });
+          await db.collection('withdrawal_requests').updateOne({ id }, { $set: { status: 'rejected', resolvedAt: new Date(), adminNote: body.note || null } });
+          if (wd.source === 'network') {
+            await db.collection('network_transactions').updateMany(
+              { refWithdrawalId: wd.id, type: 'withdrawal' },
+              { $set: { status: 'rejected' } }
+            );
+          }
+        } else {
+          return json({ error: 'bad action' }, 400);
+        }
+        const fresh = await db.collection('withdrawal_requests').findOne({ id });
+        // Notify user
+        try {
+          const targetUser = await db.collection('users').findOne({ id: wd.userId });
+          if (targetUser?.email) {
+            const tpl = action === 'approve'
+              ? tplWithdrawalApproved({ name: targetUser.name, amount: wd.amount, method: wd.method, ref: wd.id.slice(0, 8).toUpperCase() })
+              : tplWithdrawalRejected({ name: targetUser.name, amount: wd.amount, method: wd.method, ref: wd.id.slice(0, 8).toUpperCase(), note: body.note });
+            sendEmail({ to: targetUser.email, subject: tpl.subject, html: tpl.html, kind: `withdrawal_${action === 'approve' ? 'approved' : 'rejected'}` });
+          }
+        } catch {}
+        return json({ withdrawal: fresh });
+      }
+
+      // ============ Admin Announcements ============
+      if (route === 'admin/announcements' && method === 'GET') {
+        const list = await db.collection('announcements').find({}).sort({ createdAt: -1 }).limit(100).toArray();
+        return json({ announcements: list });
+      }
+      if (route === 'admin/announcements' && method === 'POST') {
+        const body = await req.json();
+        const title = String(body.title || '').trim().slice(0, 120);
+        const message = String(body.message || '').trim().slice(0, 2000);
+        if (!title || !message) return json({ error: 'title and message required' }, 400);
+        const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+        const ann = {
+          id: uuidv4(),
+          title, message,
+          active: true,
+          expiresAt,
+          createdAt: new Date(),
+          createdBy: u.email,
+        };
+        await db.collection('announcements').insertOne(ann);
+        return json({ announcement: ann });
+      }
+      if (segments[0] === 'admin' && segments[1] === 'announcements' && segments[2] && method === 'DELETE') {
+        await db.collection('announcements').deleteOne({ id: segments[2] });
+        return json({ ok: true });
+      }
+      if (segments[0] === 'admin' && segments[1] === 'announcements' && segments[2] && method === 'PUT') {
+        const body = await req.json();
+        const update = {};
+        if (body.active !== undefined) update.active = !!body.active;
+        if (body.title !== undefined) update.title = String(body.title).trim().slice(0, 120);
+        if (body.message !== undefined) update.message = String(body.message).trim().slice(0, 2000);
+        if (body.expiresAt !== undefined) update.expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+        await db.collection('announcements').updateOne({ id: segments[2] }, { $set: update });
+        const fresh = await db.collection('announcements').findOne({ id: segments[2] });
+        return json({ announcement: fresh });
+      }
+
+      // ============ Admin Support Tickets ============
+      // List all tickets (optionally filtered by status)
+      if (route === 'admin/support/tickets' && method === 'GET') {
+        const url = new URL(req.url);
+        const status = url.searchParams.get('status') || 'all';
+        const q = status === 'all' ? {} : { status };
+        const list = await db.collection('support_tickets')
+          .find(q)
+          .sort({ lastMessageAt: -1 })
+          .project({ messages: 0 })
+          .limit(300)
+          .toArray();
+        return json({ tickets: list });
+      }
+      // Total unread (admin view) count
+      if (route === 'admin/support/unread' && method === 'GET') {
+        const agg = await db.collection('support_tickets').aggregate([
+          { $group: { _id: null, total: { $sum: '$unreadForAdmin' } } }
+        ]).toArray();
+        return json({ unread: agg[0]?.total || 0 });
+      }
+      // Change ticket status (close/reopen)
+      if (segments[0] === 'admin' && segments[1] === 'support' && segments[2] === 'tickets' && segments[3] && method === 'PATCH') {
+        const body = await req.json().catch(() => ({}));
+        const status = String(body.status || '').toLowerCase();
+        if (!['open', 'closed'].includes(status)) return json({ error: 'bad status' }, 400);
+        await db.collection('support_tickets').updateOne(
+          { id: segments[3] },
+          { $set: { status, updatedAt: new Date() } }
+        );
+        const fresh = await db.collection('support_tickets').findOne({ id: segments[3] });
+        return json({ ticket: fresh });
+      }
+    }
+
+    // ============ Support Tickets (User side) ============
+    // Create new ticket
+    if (route === 'support/tickets' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const body = await req.json().catch(() => ({}));
+      const subject = String(body.subject || '').trim().slice(0, 150);
+      const message = String(body.message || '').trim().slice(0, 4000);
+      if (!subject || !message) return json({ error: 'Subject and message required' }, 400);
+      const now = new Date();
+      const ticket = {
+        id: uuidv4(),
+        userId: u.id,
+        userEmail: u.email,
+        userName: u.name || u.email,
+        subject,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+        lastMessageAt: now,
+        lastMessage: message,
+        lastSender: 'user',
+        unreadForUser: 0,
+        unreadForAdmin: 1,
+        messages: [{
+          id: uuidv4(),
+          sender: 'user',
+          senderEmail: u.email,
+          text: message,
+          createdAt: now,
+        }],
+      };
+      await db.collection('support_tickets').insertOne(ticket);
+      return json({ ticket });
+    }
+    // List user's own tickets (without full messages for lightness)
+    if (route === 'support/tickets' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const list = await db.collection('support_tickets')
+        .find({ userId: u.id })
+        .sort({ lastMessageAt: -1 })
+        .project({ messages: 0 })
+        .limit(100)
+        .toArray();
+      return json({ tickets: list });
+    }
+    // Count of unread admin replies across all tickets for current user
+    if (route === 'support/unread' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const agg = await db.collection('support_tickets').aggregate([
+        { $match: { userId: u.id } },
+        { $group: { _id: null, total: { $sum: '$unreadForUser' } } }
+      ]).toArray();
+      return json({ unread: agg[0]?.total || 0 });
+    }
+    // Fetch specific ticket (owner OR admin). Mark read for viewer.
+    if (segments[0] === 'support' && segments[1] === 'tickets' && segments[2] && !segments[3] && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const t = await db.collection('support_tickets').findOne({ id: segments[2] });
+      if (!t) return json({ error: 'not found' }, 404);
+      if (t.userId !== u.id && u.role !== 'admin') return json({ error: 'forbidden' }, 403);
+      // Clear unread for viewer
+      const clearField = u.role === 'admin' ? 'unreadForAdmin' : 'unreadForUser';
+      if ((t[clearField] || 0) > 0) {
+        await db.collection('support_tickets').updateOne({ id: t.id }, { $set: { [clearField]: 0 } });
+        t[clearField] = 0;
+      }
+      return json({ ticket: t });
+    }
+    // Post message on a ticket (owner OR admin)
+    if (segments[0] === 'support' && segments[1] === 'tickets' && segments[2] && segments[3] === 'messages' && method === 'POST') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const t = await db.collection('support_tickets').findOne({ id: segments[2] });
+      if (!t) return json({ error: 'not found' }, 404);
+      if (t.userId !== u.id && u.role !== 'admin') return json({ error: 'forbidden' }, 403);
+      if (t.status === 'closed') return json({ error: 'ticket closed' }, 400);
+      const body = await req.json().catch(() => ({}));
+      const text = String(body.text || '').trim().slice(0, 4000);
+      if (!text) return json({ error: 'message required' }, 400);
+      const now = new Date();
+      const sender = u.role === 'admin' ? 'admin' : 'user';
+      const msg = { id: uuidv4(), sender, senderEmail: u.email, text, createdAt: now };
+      const inc = sender === 'admin' ? { unreadForUser: 1 } : { unreadForAdmin: 1 };
+      await db.collection('support_tickets').updateOne(
+        { id: t.id },
+        {
+          $push: { messages: msg },
+          $set: { lastMessageAt: now, updatedAt: now, lastMessage: text, lastSender: sender },
+          $inc: inc,
+        }
+      );
+      const fresh = await db.collection('support_tickets').findOne({ id: t.id });
+      return json({ ticket: fresh });
+    }
+
+    // ============ Public (auth-required) endpoints ============
+    // ============================================================
+    // ============== NETWORK COMPENSATION ENGINE  ===============
+    // ============================================================
+
+    // ---- USER endpoints ----
+
+    // Snapshot for the user's Network Compensation dashboard
+    if (route === 'network/me' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      // Make sure the user has a referral code
+      await ensureReferralCode(u.id);
+      const summary = await getUserNetworkSummary(u.id);
+      return json({ summary });
+    }
+
+    // User's own network transactions
+    if (route === 'network/transactions' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const url = new URL(req.url);
+      const type = url.searchParams.get('type'); // optional filter
+      const q = { userId: u.id };
+      if (type) q.type = type;
+      const list = await db.collection('network_transactions')
+        .find(q).sort({ createdAt: -1 }).limit(500).toArray();
+      return json({ transactions: list });
+    }
+
+    // Public list of active levels (read-only, for the user dashboard)
+    if (route === 'network/levels' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const list = await db.collection('network_levels')
+        .find({ active: true }).sort({ levelNumber: 1, order: 1 }).toArray();
+      return json({ levels: list });
+    }
+
+    // User's own direct referrals (with paid/unpaid status)
+    if (route === 'network/team' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const s = await db.collection('settings').findOne({ id: 'global' }) || {};
+      const minThreshold = Number(s?.network?.minPaidDepositThreshold || 50);
+      const directs = await db.collection('users')
+        .find({ referredBy: u.id }, { projection: { passwordHash: 0 } })
+        .sort({ createdAt: -1 }).toArray();
+      const out = [];
+      for (const d of directs) {
+        const agg = await db.collection('deposit_requests').aggregate([
+          { $match: { userId: d.id, status: 'approved' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]).toArray();
+        const totalDep = agg[0]?.total || 0;
+        out.push({
+          id: d.id,
+          name: d.name,
+          email: d.email,
+          joinedAt: d.createdAt,
+          totalDeposits: totalDep,
+          isPaid: totalDep >= minThreshold,
+          currentLevel: d.currentLevel || 0,
+        });
+      }
+      return json({ team: out, minPaidDepositThreshold: minThreshold });
+    }
+
+    // ---- ADMIN endpoints ----
+    if (segments[0] === 'admin' && segments[1] === 'network') {
+      const u = await requireUser(req);
+      if (!u || u.role !== 'admin') return json({ error: 'forbidden' }, 403);
+
+      // CRUD: levels
+      if (route === 'admin/network/levels' && method === 'GET') {
+        const list = await db.collection('network_levels')
+          .find({}).sort({ levelNumber: 1, order: 1 }).toArray();
+        return json({ levels: list });
+      }
+      if (route === 'admin/network/levels' && method === 'POST') {
+        const body = await req.json();
+        const lv = {
+          id: uuidv4(),
+          levelNumber: Math.max(1, parseInt(body.levelNumber) || 1),
+          name: String(body.name || '').trim().slice(0, 80) || `Level ${body.levelNumber || 1}`,
+          requiredPaidReferrals: Math.max(0, parseInt(body.requiredPaidReferrals) || 0),
+          requiredTeamBusiness: Math.max(0, Number(body.requiredTeamBusiness) || 0),
+          levelCommission: Math.max(0, Number(body.levelCommission) || 0),
+          monthlySalary: Math.max(0, Number(body.monthlySalary) || 0),
+          active: body.active !== false,
+          order: Math.max(0, parseInt(body.order) || 0),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        await db.collection('network_levels').insertOne(lv);
+        return json({ level: lv });
+      }
+      if (segments[3] && method === 'PUT') {
+        // /admin/network/levels/:id
+        const id = segments[3];
+        const body = await req.json();
+        const $set = { updatedAt: new Date() };
+        if (body.levelNumber !== undefined) $set.levelNumber = Math.max(1, parseInt(body.levelNumber) || 1);
+        if (body.name !== undefined) $set.name = String(body.name || '').trim().slice(0, 80);
+        if (body.requiredPaidReferrals !== undefined) $set.requiredPaidReferrals = Math.max(0, parseInt(body.requiredPaidReferrals) || 0);
+        if (body.requiredTeamBusiness !== undefined) $set.requiredTeamBusiness = Math.max(0, Number(body.requiredTeamBusiness) || 0);
+        if (body.levelCommission !== undefined) $set.levelCommission = Math.max(0, Number(body.levelCommission) || 0);
+        if (body.monthlySalary !== undefined) $set.monthlySalary = Math.max(0, Number(body.monthlySalary) || 0);
+        if (body.active !== undefined) $set.active = !!body.active;
+        if (body.order !== undefined) $set.order = Math.max(0, parseInt(body.order) || 0);
+        await db.collection('network_levels').updateOne({ id }, { $set });
+        const fresh = await db.collection('network_levels').findOne({ id });
+        return json({ level: fresh });
+      }
+      if (segments[3] && method === 'DELETE') {
+        const id = segments[3];
+        await db.collection('network_levels').deleteOne({ id });
+        return json({ ok: true });
+      }
+      if (route === 'admin/network/levels/reorder' && method === 'POST') {
+        const { ids } = await req.json();
+        if (!Array.isArray(ids)) return json({ error: 'ids required' }, 400);
+        let n = 0;
+        for (const id of ids) {
+          await db.collection('network_levels').updateOne({ id }, { $set: { order: n++, updatedAt: new Date() } });
+        }
+        return json({ ok: true });
+      }
+
+      // Members overview — paged list of users with their network metrics
+      if (route === 'admin/network/members' && method === 'GET') {
+        const url = new URL(req.url);
+        const q = url.searchParams.get('q') || '';
+        const filter = q ? {
+          $or: [
+            { email: { $regex: q, $options: 'i' } },
+            { name: { $regex: q, $options: 'i' } },
+            { referralCode: { $regex: q.toUpperCase(), $options: 'i' } },
+          ],
+        } : {};
+        const users = await db.collection('users')
+          .find(filter, { projection: { passwordHash: 0 } })
+          .sort({ networkBalance: -1, createdAt: -1 })
+          .limit(200)
+          .toArray();
+        return json({ members: users });
+      }
+
+      // Admin re-evaluate (single user or all)
+      if (route === 'admin/network/recalc' && method === 'POST') {
+        const body = await req.json().catch(() => ({}));
+        if (body.userId) {
+          await evaluateUserLevel(body.userId);
+          await evaluateUpline(body.userId);
+          return json({ ok: true, target: body.userId });
+        }
+        const users = await db.collection('users').find({}, { projection: { id: 1 } }).toArray();
+        for (const u2 of users) { await evaluateUserLevel(u2.id); }
+        return json({ ok: true, scanned: users.length });
+      }
+
+      // Admin trigger salary pay (force = ignore the day check)
+      if (route === 'admin/network/salary/run' && method === 'POST') {
+        const body = await req.json().catch(() => ({}));
+        const r = await runMonthlySalaryCheck(!!body.force);
+        return json({ ok: true, result: r });
+      }
+
+      // Admin: override / set sponsor
+      if (segments[2] === 'sponsor' && segments[3] && method === 'POST') {
+        const targetId = segments[3];
+        const body = await req.json();
+        let sponsorId = body.sponsorId || null;
+        if (!sponsorId && body.sponsorCode) {
+          sponsorId = await resolveSponsorByCode(body.sponsorCode);
+        }
+        // Prevent self-sponsor or cycle
+        if (sponsorId === targetId) return json({ error: 'Cannot sponsor self' }, 400);
+        if (sponsorId) {
+          // Walk up from sponsorId; reject if targetId appears
+          let cur = await db.collection('users').findOne({ id: sponsorId });
+          const seen = new Set();
+          while (cur?.referredBy && !seen.has(cur.referredBy)) {
+            if (cur.referredBy === targetId) return json({ error: 'Cycle detected' }, 400);
+            seen.add(cur.referredBy);
+            cur = await db.collection('users').findOne({ id: cur.referredBy });
+          }
+        }
+        await db.collection('users').updateOne({ id: targetId }, { $set: { referredBy: sponsorId || null } });
+        await evaluateUserLevel(targetId);
+        await evaluateUpline(targetId);
+        const fresh = await db.collection('users').findOne({ id: targetId }, { projection: { passwordHash: 0 } });
+        return json({ user: fresh });
+      }
+
+      // Admin: list of network transactions across all users (audit log)
+      if (route === 'admin/network/transactions' && method === 'GET') {
+        const url = new URL(req.url);
+        const userId = url.searchParams.get('userId');
+        const type = url.searchParams.get('type');
+        const q = {};
+        if (userId) q.userId = userId;
+        if (type) q.type = type;
+        const list = await db.collection('network_transactions')
+          .find(q).sort({ createdAt: -1 }).limit(500).toArray();
+        return json({ transactions: list });
+      }
+    }
+
+    // Public subset of admin settings — min deposit/withdraw thresholds
+    if (route === 'settings/public' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const s = await db.collection('settings').findOne({ id: 'global' }) || {};
+      return json({ settings: {
+        minDeposit: Number(s.minDeposit || 10),
+        minWithdrawal: Number(s.minWithdrawal || 10),
+      }});
+    }
+
+    // Active announcement banner shown to logged-in users
+    if (route === 'announcements/active' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+      const now = new Date();
+      const ann = await db.collection('announcements').find({
+        active: true,
+        $or: [
+          { expiresAt: null },
+          { expiresAt: { $gt: now } }
+        ]
+      }).sort({ createdAt: -1 }).limit(1).toArray();
+      return json({ announcement: ann[0] || null });
+    }
+
+    // Leaderboard — top 10 traders by P&L on LIVE-account closed trades,
+    // resolved since today's local 00:00 UTC. Resets daily at midnight UTC
+    // (i.e. when a fresh trade resolves on the next calendar day, only those
+    // new trades count). Demo trades are excluded.
+    if (route === 'leaderboard' && method === 'GET') {
+      const u = await requireUser(req);
+      if (!u) return json({ error: 'unauthorized' }, 401);
+
+      // Start of today (UTC). Anything resolved at or after this moment is
+      // included. We use UTC so the leaderboard rolls over predictably for
+      // every user regardless of their local timezone.
+      const dayStart = new Date();
+      dayStart.setUTCHours(0, 0, 0, 0);
+
+      const top = await db.collection('trades').aggregate([
+        { $match: {
+            status: 'closed',
+            account: 'live',                  // live-account trades only
+            resolvedAt: { $gte: dayStart },   // today only — daily reset
+        } },
+        { $group: {
+            _id: '$userId',
+            userEmail: { $first: '$userEmail' },
+            totalPnl: { $sum: '$pnl' },
+            wins: { $sum: { $cond: [{ $eq: ['$outcome', 'win'] }, 1, 0] } },
+            losses: { $sum: { $cond: [{ $eq: ['$outcome', 'loss'] }, 1, 0] } },
+            trades: { $sum: 1 },
+        } },
+        { $sort: { totalPnl: -1 } },
+        { $limit: 10 },
+        { $project: { _id: 0, userId: '$_id', userEmail: 1, totalPnl: 1, wins: 1, losses: 1, trades: 1 } }
+      ]).toArray();
+
+      // Enrich each leaderboard row with the trader's display name pulled
+      // from the users collection so the UI can show a friendly label
+      // alongside the short ID (e.g. "Alice #A1B2C3").
+      const leaderIds = top.map((r) => r.userId);
+      const userDocs = leaderIds.length
+        ? await db.collection('users').find(
+            { id: { $in: leaderIds } },
+            { projection: { _id: 0, id: 1, name: 1, email: 1 } }
+          ).toArray()
+        : [];
+      const userMap = {};
+      userDocs.forEach((d) => { userMap[d.id] = d; });
+
+      const shortId = (uuid) => (uuid || '').replace(/-/g, '').slice(-6).toUpperCase() || 'ANON';
+      const anonymized = top.map((row, idx) => {
+        const ud = userMap[row.userId] || {};
+        const emailPrefix = (ud.email || row.userEmail || '').split('@')[0];
+        const displayName = (ud.name && ud.name.trim()) || emailPrefix || 'Anonymous';
+        return {
+          rank: idx + 1,
+          name: displayName,
+          userId: `#${shortId(row.userId)}`,
+          totalPnl: +(row.totalPnl || 0).toFixed(2),
+          wins: row.wins || 0,
+          losses: row.losses || 0,
+          trades: row.trades || 0,
+          isMe: row.userId === u.id,
+        };
+      });
+      return json({ leaderboard: anonymized });
+    }
+
+    if (route === '' || route === 'health') {
+      return json({ ok: true, ts: Date.now() });
+    }
+
+    return json({ error: 'not found', route, method }, 404);
+  } catch (err) {
+    console.error('API error', err);
+    return json({ error: 'server error', detail: String(err?.message || err) }, 500);
+  }
+}
+
+export const GET = handler;
+export const POST = handler;
+export const PUT = handler;
+export const DELETE = handler;
+export const PATCH = handler;
+export const dynamic = 'force-dynamic';
