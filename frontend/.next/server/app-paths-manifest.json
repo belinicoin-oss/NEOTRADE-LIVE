@@ -1,9 +1,5 @@
 {
-  "/login/page": "app/login/page.js",
-  "/signup/page": "app/signup/page.js",
-  "/trade/page": "app/trade/page.js",
-  "/admin/page": "app/admin/page.js",
-  "/network/page": "app/network/page.js",
   "/page": "app/page.js",
+  "/api/crypto-ticker/route": "app/api/crypto-ticker/route.js",
   "/api/[[...path]]/route": "app/api/[[...path]]/route.js"
 }

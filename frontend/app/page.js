@@ -121,14 +121,35 @@ export default function NeotradeLanding() {
     let cancelled = false;
     let prev = {};
 
+    // Crypto symbols are not exposed by /api/assets (forex + gold only by
+    // design — see lib/liveAssetsConfig.js). For the homepage ticker we
+    // proxy through our own /api/crypto-ticker (CoinGecko server-side) to
+    // bypass browser CORS.
+    const cryptoMap = { 'BTC/USD': 1, 'ETH/USD': 1, 'SOL/USD': 1 };
+
     const tick = async () => {
       try {
-        const res = await fetch('/api/assets', { cache: 'no-store' });
-        const data = await res.json();
-        const list = Array.isArray(data?.assets) ? data.assets : [];
+        const [assetsRes, cryptoRes] = await Promise.all([
+          fetch('/api/assets', { cache: 'no-store' }).then(r => r.json()).catch(() => ({})),
+          fetch('/api/crypto-ticker', { cache: 'no-store' }).then(r => r.json()).catch(() => ({})),
+        ]);
+        const list = Array.isArray(assetsRes?.assets) ? assetsRes.assets : [];
         const byDisplay = Object.fromEntries(list.map(a => [a.display, a]));
         if (cancelled) return;
         const next = want.map(w => {
+          // Crypto path: server-side proxy provides price + 24h change directly
+          if (cryptoMap[w.symbol] && cryptoRes && cryptoRes[w.symbol] && typeof cryptoRes[w.symbol].price === 'number') {
+            const p = Number(cryptoRes[w.symbol].price);
+            const change = Number(cryptoRes[w.symbol].change ?? 0);
+            prev[w.symbol] = p;
+            return {
+              symbol: w.symbol,
+              price: fmt(p, w.decimals),
+              change: `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`,
+              up: change >= 0,
+            };
+          }
+          // Forex / gold path: same as before, from /api/assets
           const a = byDisplay[w.srcDisplay];
           if (!a) return { symbol: w.symbol, price: '-.--', change: '--%', up: true };
           const p = Number(a.price);
